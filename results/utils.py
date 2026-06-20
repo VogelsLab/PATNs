@@ -200,3 +200,304 @@ def solve_rk4_springBox(init_condition, W, tauE, tauI, T, dt, a, b, c, bias):
         r[:, i] = rk4_step(r[:, i-1], W, external_input, tauE, tauI, dt, a, b, c, bias)
  
     return tvec, r.T
+    
+# =====================================================================
+# Orbit and fixed-point analysis
+# =====================================================================
+def nearest_phase_idx(x, r_orbit):
+    """
+    Return the index j* such that ||x - r_orbit[:, j*]|| is minimal.
+
+    Parameters
+    ----------
+    x      : np.ndarray, shape (N,)
+    r_orbit: np.ndarray, shape (N, T_orbit)
+
+    Returns
+    -------
+    j : int
+    """
+    d2 = np.sum((r_orbit - x[:, None])**2, axis=0)
+    return int(np.argmin(d2))
+
+
+def compute_dominant_freq(time, x, s, num_peaks=2):
+    """
+    Compute dominant frequencies of each neuron's trajectory via FFT.
+
+    Parameters
+    ----------
+    time     : np.ndarray, shape (T,)
+    x        : np.ndarray, shape (T, N)
+    s        : np.ndarray, shape (N,)  — baseline to subtract before FFT
+    num_peaks: int — number of dominant frequencies to extract per neuron
+
+    Returns
+    -------
+    dominant_freqs    : list of length N, each entry shape (num_peaks,)
+    dominant_periods  : list of length N, each entry shape (num_peaks,)
+    dominant_phases   : list of length N, each entry shape (num_peaks,)
+    peak_indices      : list of length N, each entry shape (num_peaks,)
+    positive_freqs    : np.ndarray — the positive frequency bins
+    fft_amplitudes    : list of length N, each entry shape (T//2,)
+    fft_phases        : list of length N, each entry shape (T//2,)
+    """
+    freqs = np.fft.fftfreq(len(time), d=time[1] - time[0])
+    positive_freqs = freqs[freqs > 0]
+
+    dominant_freqs, dominant_periods, dominant_phases = [], [], []
+    peak_indices, fft_amplitudes, fft_phases = [], [], []
+
+    for i in range(x.shape[1]):
+        variable_fft = np.fft.fft(x[:, i] - s[i])
+        amplitudes = np.abs(variable_fft[freqs > 0])
+        phases     = np.angle(variable_fft[freqs > 0], deg=True)
+
+        top_idx = np.argsort(amplitudes)[::-1][:num_peaks]
+
+        dominant_freqs.append(positive_freqs[top_idx])
+        dominant_periods.append(1 / positive_freqs[top_idx])
+        dominant_phases.append(phases[top_idx])
+        peak_indices.append(top_idx)
+        fft_amplitudes.append(amplitudes)
+        fft_phases.append(phases)
+
+    return dominant_freqs, dominant_periods, dominant_phases, peak_indices, positive_freqs, fft_amplitudes, fft_phases
+
+
+def precompute_fixed_point(init_condition, W, tauE, tauI, T, dt,
+                           a, b, c, s, bias, tail_avg_steps=500):
+    """
+    Estimate the fixed point by running unforced dynamics and averaging the tail.
+
+    Parameters
+    ----------
+    init_condition  : np.ndarray, shape (N,)
+    tail_avg_steps  : int — number of final time steps to average over
+
+    Returns
+    -------
+    r_fp    : np.ndarray, shape (N,) — estimated fixed point
+    r       : np.ndarray, shape (T/dt+1, N) — full trajectory
+    """
+    t, r = solve_rk4_springBox(init_condition, W, tauE, tauI, T, dt, a, b, c, bias)
+    r_fp = np.mean(r[-tail_avg_steps:, :], axis=0)
+    return r_fp, r
+
+
+def precompute_orbit(ic_orbit, W, tauE, tauI, T, dt,
+                     a, b, c, s, bias, no_freqs, wash):
+    """
+    Run unforced dynamics from ic_orbit and extract one full period of the
+    limit cycle, along with its unit tangent vector.
+
+    Parameters
+    ----------
+    ic_orbit : np.ndarray, shape (N,)
+    no_freqs : int   — number of frequency peaks to extract
+    wash     : float — transient duration (s) to discard before FFT
+
+    Returns
+    -------
+    orbit_info : dict with keys:
+        r_orbit    : np.ndarray, shape (N, n0)   — one period of the orbit
+        t_orbit    : np.ndarray, shape (n0,)     — corresponding time vector
+        t_hat      : np.ndarray, shape (N, n0)   — unit tangent along orbit
+        n0         : int                         — number of steps per period
+        tvec       : np.ndarray                  — full time vector
+        r_springBox: np.ndarray, shape (N, T/dt+1) — full trajectory
+    """
+    from matplotlib import pyplot as plt
+
+    tvec = np.arange(0, T + dt, dt)
+    r_springBox = np.zeros((ic_orbit.shape[0], len(tvec)))
+    r_springBox[:, 0] = ic_orbit
+    external_input = np.zeros(W.shape[0])
+
+    for i in range(1, len(tvec)):
+        r_springBox[:, i] = rk4_step(
+            r_springBox[:, i-1], W, external_input, tauE, tauI, dt, a, b, c, bias)
+
+    _, dominant_periods, _, _, _, _, _ = compute_dominant_freq(
+        tvec[int(wash/dt):],
+        r_springBox.T[int(wash/dt):, :],
+        s,
+        num_peaks=no_freqs
+    )
+    dominant_period = dominant_periods[0][0]
+    n0 = int(np.round(dominant_period / dt))
+
+    r_orbit = r_springBox[:, (int(T/dt) - n0):int(T/dt)].copy()
+    t_orbit = tvec[(int(T/dt) - n0):int(T/dt)].copy()
+
+    plt.plot(r_orbit.T)
+    plt.show()
+
+    v_orbit = np.gradient(r_orbit, t_orbit, axis=1)
+    t_hat = v_orbit / (np.linalg.norm(v_orbit, axis=0, keepdims=True) + 1e-12)
+
+    return dict(r_orbit=r_orbit, t_orbit=t_orbit, t_hat=t_hat,
+                n0=n0, tvec=tvec, r_springBox=r_springBox)
+
+
+def solve_rk4_controlled(ic_orbit, ic_transient, W, cues, tauE, tauI, T, dt,
+                         a, b, c, s, bias, r_fp, orbit_info,
+                         sigma_ou=0.0, tau_c=0.01, t_start_noise=0.0, rng=None):
+    """
+    Simulate controlled dynamics with stop/go/hold/resume cue inputs and
+    optional Ornstein-Uhlenbeck noise.
+
+    Parameters
+    ----------
+    ic_orbit     : np.ndarray, shape (N,) — initial condition for the orbit
+    ic_transient : np.ndarray, shape (N,) — initial condition for transient kick
+    W            : np.ndarray, shape (N, N)
+    cues         : dict with keys 'stop', 'go', 'transient', 'hold_on', 'resume'
+                   each a list [enabled, t_start, duration, ...]
+    r_fp         : np.ndarray, shape (N,) — fixed point estimate
+    orbit_info   : dict from precompute_orbit
+    sigma_ou     : float — OU noise amplitude (0 = no noise)
+    tau_c        : float — OU correlation time constant
+    t_start_noise: float — time at which noise injection begins
+    rng          : np.random.Generator or None
+
+    Returns
+    -------
+    tvec : np.ndarray, shape (T/dt+1,)
+    r    : np.ndarray, shape (T/dt+1, N)
+    exts : list (reserved for external input logging)
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    tvec    = orbit_info["tvec"]
+    r_orbit = orbit_info["r_orbit"]
+    t_hat   = orbit_info["t_hat"]
+
+    d = ic_orbit.shape[0]
+    r = np.zeros((d, len(tvec))) + s[:, None]
+    r[:, 0] = s
+
+    quint = d // 5
+    tau_vec = np.concatenate([
+        float(tauE) * np.ones(4 * quint),
+        float(tauI) * np.ones(d - 4 * quint)
+    ])
+
+    n = np.zeros(d, dtype=float)
+    inv_tau_c = 1.0 / float(tau_c)
+    if sigma_ou > 0:
+        s_n = float(sigma_ou) * np.sqrt(float(tau_c) / 2.0)
+        n = rng.normal(0.0, s_n, size=d)
+
+    exts = []
+
+    for i in range(1, len(tvec)):
+        external_input = np.zeros(W.shape[0])
+
+        # kick onto orbit at t=1
+        if np.isclose(tvec[i-1], 1, atol=0.5 * dt):
+            external_input = (1.0 / dt) * ic_orbit
+
+        # STOP: clamp state toward baseline
+        if cues['stop'][0]:
+            in_stop1 = cues['stop'][1] <= tvec[i-1] <= cues['stop'][1] + cues['stop'][2]
+            in_stop2 = cues['stop'][3] <= tvec[i-1] <= cues['stop'][3] + cues['stop'][4]
+            if in_stop1 or in_stop2:
+                external_input = -10 * (r[:, i-1] - s)
+
+        # TRANSIENT: kick onto transient IC
+        if cues['transient'][0] and np.isclose(tvec[i-1], cues['transient'][1], atol=0.5*dt):
+            external_input = (1 / dt) * ic_transient
+
+        # HOLD ON: clamp state toward fixed point
+        if cues['hold_on'][0]:
+            if cues['hold_on'][1] <= tvec[i-1] <= cues['hold_on'][1] + cues['hold_on'][2]:
+                external_input = 10 * (r_fp - r[:, i-1])
+
+        # GO: kick back onto orbit
+        if cues['go'][0] and np.isclose(tvec[i-1], cues['go'][1], atol=0.5*dt):
+            external_input = (1 / dt) * ic_orbit
+
+        # RESUME: phase-matched push back to orbit
+        if cues['resume'][0]:
+            if cues['resume'][1] <= tvec[i-1] <= cues['resume'][1] + cues['resume'][2]:
+                j = nearest_phase_idx(r[:, i-1], r_orbit)
+                r_star  = r_orbit[:, j]
+                tauhat  = t_hat[:, j]
+                e       = r_star - r[:, i-1]
+                e_tan   = np.dot(e, tauhat) * tauhat
+                e_norm  = e - e_tan
+                external_input += 10 * 0.6 * e_norm
+
+        # RK4 step
+        r_det = rk4_step(r[:, i-1], W, external_input, tauE, tauI, dt, a, b, c, bias)
+
+        # OU noise injection
+        t_now = tvec[i]
+        if (t_now >= t_start_noise) and (sigma_ou > 0):
+            n = n + (-inv_tau_c * n) * dt + float(sigma_ou) * np.sqrt(dt) * rng.normal(size=d)
+            r[:, i] = r_det + dt * (n / tau_vec)
+        else:
+            r[:, i] = r_det
+
+    return tvec, r.T, exts
+    
+# =====================================================================
+# Noisy springBox simulation (OU noise)
+# =====================================================================
+def solve_rk4_noisy_springBox(init_condition, W, tauE, tauI, T, dt,
+                               a, b, c, bias,
+                               sigma_ic=0.0, sigma_ou=0.0,
+                               tau_c=0.01, t_start_noise=None, rng=None):
+    """
+    Unforced dynamics with optional IC perturbation and Ornstein-Uhlenbeck noise.
+
+    Parameters
+    ----------
+    sigma_ic      : float — std of Gaussian noise added to initial condition
+    sigma_ou      : float — OU diffusion coefficient
+    tau_c         : float — OU correlation time constant
+    t_start_noise : float or None — time at which OU noise begins (None = never)
+
+    Returns
+    -------
+    tvec : np.ndarray, shape (T/dt+1,)
+    r    : np.ndarray, shape (T/dt+1, N)
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    tvec = np.arange(0, T + dt, dt)
+    d = len(init_condition)
+    r = np.zeros((d, len(tvec)))
+    r[:, 0] = init_condition + rng.normal(0.0, sigma_ic, size=d) if sigma_ic > 0 else init_condition
+
+    external_input = np.zeros(W.shape[0])
+    if t_start_noise is None:
+        t_start_noise = np.inf
+
+    n = np.zeros(d, dtype=float)
+    inv_tau_c = 1.0 / float(tau_c)
+    quint = d // 5
+    tau_vec = np.concatenate([
+        float(tauE) * np.ones(4 * quint),
+        float(tauI) * np.ones(d - 4 * quint)
+    ])
+    ou_started = False
+
+    for i in range(1, len(tvec)):
+        t = tvec[i]
+        r_det = rk4_step(r[:, i-1], W, external_input, tauE, tauI, dt, a, b, c, bias)
+        if (t >= t_start_noise) and (sigma_ou > 0):
+            if not ou_started:
+                s_n = float(sigma_ou) * np.sqrt(float(tau_c) / 2.0)
+                n = rng.normal(0.0, s_n, size=d)
+                ou_started = True
+            n = n + (-inv_tau_c * n) * dt + float(sigma_ou) * np.sqrt(dt) * rng.normal(size=d)
+            r[:, i] = r_det + dt * (n / tau_vec)
+        else:
+            n[:] = 0.0
+            ou_started = False
+            r[:, i] = r_det
+
+    return tvec, r.T

@@ -1,6 +1,10 @@
 import numpy as np
 import scipy.linalg
 from scipy.special import expit 
+from sklearn.decomposition import PCA
+from numpy.fft import fft, fftfreq
+from scipy.signal import find_peaks
+from scipy.stats import entropy
 
 # =====================================================================
 # Lyapunov-based initial conditions
@@ -501,3 +505,160 @@ def solve_rk4_noisy_springBox(init_condition, W, tauE, tauI, T, dt,
             r[:, i] = r_det
 
     return tvec, r.T
+
+# =====================================================================
+# Linear dynamics — numerical RK4 (arbitrary N, E/I split)
+# =====================================================================
+def J_dynamics_numerical(J, dt=0.1, T=100, tauE=1, tauI=1, x=None):
+    """
+    Simulate linear dynamics x' = (J - I) x using RK4, with separate
+    time constants for E and I populations (first half E, second half I).
+
+    Parameters
+    ----------
+    J  : np.ndarray, shape (N, N)
+        Connectivity matrix (eigenvalues Re(λ) < 1).
+    dt : float
+    T  : float
+    tauE, tauI : float
+    x  : np.ndarray, shape (N,) or None
+        Initial condition. If None, uses the most amplifying IC from init_cond(J).
+
+    Returns
+    -------
+    r          : np.ndarray, shape (T/dt, N)
+    proxy_ampl : float — max norm / initial norm
+    """
+    no_points = int(T / dt)
+    tvec = np.linspace(0, T, no_points)
+    A = J - np.eye(J.shape[0])
+    N = A.shape[0]
+    half = N // 2
+
+    if x is None:
+        x = init_cond(J)[:, 0].copy()
+    x = np.array(x, dtype=float, copy=True)
+
+    r = np.zeros((N, no_points))
+    r[:, 0] = x
+
+    for t in range(no_points - 1):
+        def _deriv(v):
+            Av = A @ v
+            return np.concatenate([Av[:half] / tauE, Av[half:] / tauI])
+
+        k1 = _deriv(x)
+        k2 = _deriv(x + 0.5 * dt * k1)
+        k3 = _deriv(x + 0.5 * dt * k2)
+        k4 = _deriv(x + dt * k3)
+        x = x + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        r[:, t+1] = x
+
+    norm = np.linalg.norm(r, axis=0)
+    proxy_ampl = np.max(norm) / norm[0]
+    return r.T, proxy_ampl
+
+def classify_behaviour(r, fft_tstart, fft_tend, dt, n_pcs=5):
+    #Check norm of activity tail
+    norm_r = np.sqrt(np.sum(r[:,:]**2,axis=1)) #across time
+    activity_tail = r[-200:,:]
+    norm_tail = np.sum(np.sqrt(np.sum(activity_tail**2,axis=1)))
+    
+    l, N = activity_tail.shape
+    metrics={}
+    if not np.all(np.isfinite(r)):
+        return 'unclassified', metrics
+
+    if norm_tail<0.01*np.sqrt(N)*l:
+        behaviour = '0_fp'
+        
+    elif norm_tail>=0.01*np.sqrt(N)*l:
+        
+        #Check average of norm of trajectory for first and second half of trajectory
+        # Split the trajectory into two halves
+        third = len(norm_r) // 3
+        first_tri_avg = np.mean(norm_r[:2*third])
+        second_tri_avg = np.mean(norm_r[2*third:])
+    
+        # Calculate percentage decrease between the two averages
+        percentage_decrease = (first_tri_avg - second_tri_avg) / first_tri_avg * 100
+    
+        if percentage_decrease>20:
+            behaviour = '0_fp'
+        
+        
+        else:
+            #Check norm of activity tail with 0 mean
+            norm_tail_0mean = np.sum(np.sqrt(np.sum((activity_tail-np.mean(activity_tail,axis=0))**2,axis=1)))
+            if norm_tail_0mean<0.01*np.sqrt(N)*l:
+                behaviour = 'new_fp'
+            else:
+
+                if N==2:
+                    #signals = r[int(fft_tstart/dt):int(fft_tend/dt),:]
+                    behaviour = 'periodic'
+                    return behaviour, metrics 
+                else:
+                    # PCA
+                    pca = PCA(n_components=min(n_pcs, N))
+                    signals = pca.fit_transform(r[int(fft_tstart/dt):int(fft_tend/dt),:])  # shape (T, n_pcs)
+
+                peak_ratios = []
+                spectral_entropies = []
+                valid_dims = 0
+
+                global_max_power = 0
+                for i in range(signals.shape[1]):
+                    signal = signals[:, i]
+                    freqs = fftfreq(len(signal), d=dt)
+                    power = np.abs(fft(signal)[freqs>0])**2 + 1e-12
+                    global_max_power = max(global_max_power, np.max(power))
+
+                for i in range(signals.shape[1]):
+                    signal = signals[:, i]
+                    freqs = fftfreq(len(signal), d=dt)
+                    power = np.abs(fft(signal)[freqs>0])**2 + 1e-12
+                    norm_power = power / np.sum(power)
+
+                    # Peaks
+                    peaks, properties = find_peaks(power, height=np.max(global_max_power) * 0.01)
+                    #print(peaks)
+                    if len(peaks) == 0:
+                        continue  # Skip flat / fixed-point dimensions
+
+                    valid_dims += 1
+                    peak_powers = properties['peak_heights'] if 'peak_heights' in properties else np.array([])
+                    top_power = np.sum(np.sort(peak_powers)[-5:]) if len(peak_powers) > 0 else 0
+                    peak_ratio = top_power / np.sum(power)
+                    peak_ratios.append(peak_ratio)
+
+                    # Spectral entropy
+                    spec_entropy = entropy(norm_power, base=2)
+                    spectral_entropies.append(spec_entropy)
+
+                    #print(["peak_ratio:",peak_ratio], ["entropy:", spec_entropy])
+
+                avg_peak_ratio = np.mean(peak_ratios)
+                avg_entropy = np.mean(spectral_entropies)
+
+                if avg_peak_ratio > 0.8 and avg_entropy < 1.5:
+                    behaviour = 'periodic'
+                elif avg_peak_ratio > 0.4 and avg_entropy < 2.3:
+                    behaviour = 'quasi-periodic'
+                elif avg_peak_ratio < 0.4 and avg_entropy < 2:
+                    behaviour = 'quasi-periodic'
+                elif avg_entropy > 2 and avg_peak_ratio < 0.4:
+                    behaviour = 'chaotic'
+                elif avg_entropy > 2.3:
+                    behaviour = 'chaotic'       
+                else:
+                    behaviour = 'uncertain'
+
+                metrics = {
+                    'avg_peak_ratio': avg_peak_ratio,
+                    'avg_entropy': avg_entropy,
+                    'classification': behaviour,
+                    'valid_dimensions': valid_dims
+                }
+
+    return behaviour, metrics

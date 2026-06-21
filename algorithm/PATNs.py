@@ -86,7 +86,7 @@ def make_layout(size_list, coarse_placement):
 # =====================================================================
 def sample_eigenvalues(N, size_list, n_real_per_block, coarse_vals, lam0=0.0,
                        real_position='end', coarse_placement='beginning',
-                       mu_r=0.7, sigma_r=1, mu_im=0.0, sigma_im=0.5, rng=None):
+                       mu_r=0.7, sigma_r=0.5, mu_im=0.0, sigma_im=1, rng=None):
     if rng is None:
         rng = np.random.default_rng()
     P = len(size_list)
@@ -104,10 +104,11 @@ def sample_eigenvalues(N, size_list, n_real_per_block, coarse_vals, lam0=0.0,
     total_pairs = sum(n_pairs)
     total_reals = sum(n_real_per_block)
 
+    real_spear = 0.02
     re_pair = truncnorm((-np.inf - mu_r) / sigma_r, 0, loc=mu_r, scale=sigma_r).rvs(total_pairs, random_state=rng)
     im_pair = truncnorm((-np.inf - mu_im) / sigma_im, 0, loc=mu_im, scale=sigma_im).rvs(total_pairs, random_state=rng)
     if total_reals > 0:
-        re_real = truncnorm((-np.inf - mu_r) / sigma_r, 0, loc=mu_r, scale=sigma_r).rvs(total_reals, random_state=rng)
+        re_real = truncnorm((-np.inf - mu_r+real_spear) / sigma_r, 0, loc=mu_r+real_spear, scale=sigma_r).rvs(total_reals, random_state=rng)
     else:
         re_real = np.array([])
 
